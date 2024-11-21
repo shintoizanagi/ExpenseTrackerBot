@@ -5,6 +5,8 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import sqlite3
 import io
+import datetime
+import pandas as pd
 
 # Загрузка переменных из .env
 load_dotenv()
@@ -91,6 +93,86 @@ def create_pie_chart(user_id):
     plt.close()
     return buffer
 
+# Получить отчёт за текущий месяц
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.chat_id
+    conn = sqlite3.connect("finance.db")
+    cursor = conn.cursor()
+
+    # Получаем текущий месяц и год
+    now = datetime.datetime.now()
+    start_date = now.replace(day=1)  # Первый день месяца
+    end_date = now.replace(day=28) + datetime.timedelta(days=4)  # Последний день месяца
+    end_date = end_date.replace(day=1) - datetime.timedelta(days=1)
+
+    cursor.execute('''
+        SELECT 
+            SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END) AS income,
+            SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END) AS expense
+        FROM transactions
+        WHERE user_id = ? AND date BETWEEN ? AND ?
+    ''', (user_id, start_date, end_date))
+    result = cursor.fetchone()
+    conn.close()
+
+    income = result[0] if result[0] else 0
+    expense = result[1] if result[1] else 0
+    balance = income - expense
+
+    await update.message.reply_text(
+        f"Отчёт за {now.strftime('%B %Y')}:\n\n"
+        f"Доходы: {income:.2f}₽\n"
+        f"Расходы: {expense:.2f}₽\n"
+        f"Баланс: {balance:.2f}₽"
+    )
+
+# Построить график доходов и расходов по дням
+def create_line_chart(user_id):
+    conn = sqlite3.connect("finance.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT date, type, SUM(amount)
+        FROM transactions
+        WHERE user_id = ?
+        GROUP BY date, type
+    ''', (user_id,))
+    data = cursor.fetchall()
+    conn.close()
+
+    if not data:
+        return None  # Нет данных для графика
+
+    # Преобразуем данные в DataFrame
+    df = pd.DataFrame(data, columns=["date", "type", "amount"])
+    df["date"] = pd.to_datetime(df["date"])
+
+    # Построение графика
+    plt.figure(figsize=(10, 6))
+    for t_type, group in df.groupby("type"):
+        group = group.sort_values("date")
+        plt.plot(group["date"], group["amount"], label=t_type.capitalize())
+
+    plt.xlabel("Дата")
+    plt.ylabel("Сумма (₽)")
+    plt.title("Доходы и расходы по дням")
+    plt.legend()
+    plt.grid()
+
+    buffer = io.BytesIO()
+    plt.savefig(buffer, format="png")
+    buffer.seek(0)
+    plt.close()
+    return buffer
+
+async def linechart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.chat_id
+    chart = create_line_chart(user_id)
+
+    if chart:
+        await update.message.reply_photo(photo=chart, caption="График доходов и расходов по дням")
+    else:
+        await update.message.reply_text("Нет данных для построения графика.")
+
 # Обработчики команд
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Привет! Я помогу учитывать ваши расходы и доходы. Напишите /help для инструкций.")
@@ -149,63 +231,35 @@ async def transactions_command(update: Update, context: ContextTypes.DEFAULT_TYP
     conn.close()
 
     if results:
-        message = "Ваши транзакции:\n"
-        for transaction in results:
-            message += f"ID: {transaction[0]}, Тип: {transaction[1]}, Сумма: {transaction[2]:.2f}₽, Категория: {transaction[3]}, Заметка: {transaction[4]}, Дата: {transaction[5]}\n"
-        await update.message.reply_text(message)
+        message = "Все транзакции:\n"
+        for row in results:
+            message += f"ID: {row[0]}, Тип: {row[1]}, Сумма: {row[2]}₽, Категория: {row[3]}, Примечание: {row[4]}, Дата: {row[5]}\n"
     else:
-        await update.message.reply_text("У вас нет транзакций.")
+        message = "Нет транзакций для отображения."
 
-# Удаление транзакции по ID
-async def delete_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(message)
+
+# Удалить транзакцию
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.chat_id
-    if len(context.args) == 1:
-        try:
-            transaction_id = int(context.args[0])
-            conn = sqlite3.connect("finance.db")
-            cursor = conn.cursor()
-            cursor.execute('''
-                DELETE FROM transactions WHERE user_id = ? AND id = ?
-            ''', (user_id, transaction_id))
-            conn.commit()
-            conn.close()
-            await update.message.reply_text(f"Транзакция с ID {transaction_id} удалена.")
-        except ValueError:
-            await update.message.reply_text("Неверный формат ID.")
+    if context.args:
+        transaction_id = context.args[0]
+        conn = sqlite3.connect("finance.db")
+        cursor = conn.cursor()
+        cursor.execute('''
+            DELETE FROM transactions WHERE user_id = ? AND id = ?
+        ''', (user_id, transaction_id))
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text(f"Транзакция с ID {transaction_id} была удалена.")
     else:
-        await update.message.reply_text("Укажите ID транзакции для удаления.")
-
-# Обработка текстовых сообщений
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.message.chat_id
-    message = update.message.text.strip()
-
-    if message.startswith('+') or message.startswith('-'):
-        try:
-            trans_type = 'income' if message.startswith('+') else 'expense'
-            parts = message[1:].strip().split(maxsplit=1)
-
-            amount = float(parts[0])  # сумма
-            category_and_note = parts[1] if len(parts) > 1 else "Без категории"
-            
-            # Разделение категории и комментария
-            if "|" in category_and_note:
-                category, note = category_and_note.split("|", 1)
-                note = note.strip()
-            else:
-                category = category_and_note
-                note = "Без комментария"
-
-            add_transaction(user_id, trans_type, amount, category, note)
-            await update.message.reply_text(f"Запись добавлена: {trans_type}, {amount} ({category}), Заметка: {note}")
-        except (IndexError, ValueError):
-            await update.message.reply_text("Неверный формат. Используйте `/help` для примеров.")
-    else:
-        await update.message.reply_text("Команда не распознана. Напишите /help для инструкций.")
+        await update.message.reply_text("Пожалуйста, укажите ID транзакции для удаления.")
 
 # Основная функция
 def main():
     init_db()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -213,12 +267,12 @@ def main():
     app.add_handler(CommandHandler("balance", balance_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("chart", chart_command))
+    app.add_handler(CommandHandler("linechart", linechart_command))
+    app.add_handler(CommandHandler("report", report_command))
     app.add_handler(CommandHandler("transactions", transactions_command))
-    app.add_handler(CommandHandler("delete", delete_transaction))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("delete", delete_command))
 
-    # Запуск приложения
     app.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
